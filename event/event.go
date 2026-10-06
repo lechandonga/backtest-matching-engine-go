@@ -17,6 +17,7 @@ const (
 	KindOrderCancel Kind = 4 // 撤销委托
 	KindSplit       Kind = 5 // 拆股/合股公司行为
 	KindDividend    Kind = 6 // 现金分红公司行为
+	KindDayClose    Kind = 7 // 交易日收盘：日终失效 + 收盘价盯市
 )
 
 func (k Kind) String() string {
@@ -33,6 +34,8 @@ func (k Kind) String() string {
 		return "CORPORATE_SPLIT"
 	case KindDividend:
 		return "CORPORATE_DIVIDEND"
+	case KindDayClose:
+		return "DAY_CLOSE"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", int(k))
 	}
@@ -61,8 +64,11 @@ func (s Side) String() string {
 type OrderType uint8
 
 const (
-	Market OrderType = 1 // 市价单
-	Limit  OrderType = 2 // 限价单
+	Market       OrderType = 1 // 市价单
+	Limit        OrderType = 2 // 限价单
+	Stop         OrderType = 3 // 止损单：触发后转为市价单
+	StopLimit    OrderType = 4 // 止损限价单：触发后转为限价单
+	TrailingStop OrderType = 5 // 跟踪止损单：触发后转为市价单
 )
 
 func (t OrderType) String() string {
@@ -71,8 +77,43 @@ func (t OrderType) String() string {
 		return "MARKET"
 	case Limit:
 		return "LIMIT"
+	case Stop:
+		return "STOP"
+	case StopLimit:
+		return "STOP_LIMIT"
+	case TrailingStop:
+		return "TRAILING_STOP"
 	default:
 		return fmt.Sprintf("TYPE(%d)", int(t))
+	}
+}
+
+// TIF 有效期（time in force）。零值 TIFUnset 仅用于兼容未填写 TIF 的
+// 历史调用方，提交时按 GTC（长期有效）解释，旧行为不变。
+type TIF uint8
+
+const (
+	TIFUnset TIF = 0 // 未指定：按 GTC 处理
+	TIODay   TIF = 1 // 当日有效：当日收盘未成交/未触发即失效
+	TIFO     TIF = 2 // Immediate-Or-Cancel：立即成交能成多少成多少，剩余撤销
+	TFOK     TIF = 3 // Fill-Or-Kill：本次撮合要么全成，要么整单一点不成交
+	TGTC     TIF = 4 // 长期有效（Good-Till-Canceled）
+)
+
+func (t TIF) String() string {
+	switch t {
+	case TIFUnset:
+		return "UNSET"
+	case TIODay:
+		return "DAY"
+	case TIFO:
+		return "IOC"
+	case TFOK:
+		return "FOK"
+	case TGTC:
+		return "GTC"
+	default:
+		return fmt.Sprintf("TIF(%d)", int(t))
 	}
 }
 
@@ -105,6 +146,14 @@ type Event struct {
 	Price   float64 // 限价单价格；市价单忽略
 	Qty     int64   // 委托数量（正数）
 
+	TIF TIF // 有效期；零值按 GTC 处理
+
+	// 触发型委托参数（Type = Stop / StopLimit / TrailingStop 时使用）。
+	// 触发前不冻结资金/持仓、不参与撮合。
+	StopPrice   float64 // Stop/StopLimit 触发价：买 Stop>=价 触发，卖 Stop<=价 触发
+	TrailPct    float64 // TrailingStop 跟踪回撤比例，>0，与 TrailAmount 二选一
+	TrailAmount float64 // TrailingStop 跟踪回撤绝对价差，>0，与 TrailPct 二选一
+
 	// 撤单字段（KindOrderCancel）：复用 OrderID 与 Qty。
 	// Qty == 0 表示全部撤销；Qty > 0 表示只撤销指定剩余数量。
 
@@ -112,6 +161,10 @@ type Event struct {
 	SplitRatio  float64 // KindSplit：每股变为 SplitRatio 股（2=一拆二）
 	PostSplit   float64 // KindSplit：除权后参考价，用于未实现盈亏盯市
 	DivPerShare float64 // KindDividend：每股派现金额（税前）
+
+	// 收盘事件字段（KindDayClose）。
+	TradingDay int64   // 交易日序号（从 1 起单调递增）；0 表示由引擎按顺序推断
+	ClosePrice float64 // 收盘价：>0 时用于该标的日终盯市
 }
 
 func (e Event) String() string {

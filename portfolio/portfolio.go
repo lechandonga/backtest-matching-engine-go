@@ -82,11 +82,14 @@ func New(initialCash float64, feeRate float64) *Portfolio {
 		cash:        initialCash,
 		positions:   make(map[string]*Position),
 		marks:       make(map[string]float64),
-		feeRate:    feeRate,
+		feeRate:     feeRate,
 	}
 }
 
 func (p *Portfolio) fee(notional float64) float64 { return notional * p.feeRate }
+
+// FeeRate 返回成交费用比例（成交回报展示用）。
+func (p *Portfolio) FeeRate() float64 { return p.feeRate }
 
 // SetMark 更新某标的盯市价格（不改变任何现金流与盈亏）。
 func (p *Portfolio) SetMark(symbol string, price float64) {
@@ -175,7 +178,7 @@ func (p *Portfolio) FillBuy(symbol string, qty int64, price, refPrice float64) e
 	p.fees += fee
 
 	p.marks[symbol] = price
-	return p.reconcileLocked("fill buy "+symbol)
+	return p.reconcileLocked("fill buy " + symbol)
 }
 
 // FillSell 卖出成交：释放冻结持仓，回收价款（扣费用），结转已实现盈亏。
@@ -200,7 +203,40 @@ func (p *Portfolio) FillSell(symbol string, qty int64, price float64) error {
 	p.cash += notional - fee
 	p.fees += fee
 	p.marks[symbol] = price
-	return p.reconcileLocked("fill sell "+symbol)
+	return p.reconcileLocked("fill sell " + symbol)
+}
+
+// FillSelfCross 同一账户内买卖双方相互成交时的原子记账：
+// 买腿冻结（按 reserved 预估）解冻划转，两腿价款净额为 0、费用照扣；
+// 卖腿按成交前均价结转已实现盈亏，买腿把成交价并入成本基；
+// 总股数不变（可用 +=qty、冻结 -=qty）。
+func (p *Portfolio) FillSelfCross(symbol string, qty int64, price, reserved float64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	pos := p.positions[symbol]
+	if pos == nil || pos.Frozen < qty {
+		panic("portfolio: self-cross without reserved position")
+	}
+	notional := price * float64(qty)
+	fee := p.fee(notional) * 2 // 买卖两腿各一笔费用
+
+	// 卖腿：按成交前均价结转。
+	p.realizedPnL += notional - pos.AvgCost*float64(qty)
+
+	totalBefore := pos.Qty + pos.Frozen
+	// 卖腿出库（冻结）、买腿入库（可用），总股数不变。
+	pos.Frozen -= qty
+	oldBasis := pos.AvgCost * float64(totalBefore)
+	newBasis := oldBasis - pos.AvgCost*float64(qty) + notional
+	pos.Qty += qty
+	pos.AvgCost = newBasis / float64(totalBefore)
+
+	p.frozenCash -= reserved
+	p.cash += reserved - fee
+	p.fees += fee
+	p.marks[symbol] = price
+	return p.reconcileLocked("self-cross " + symbol)
 }
 
 // ApplyDividend 现金分红：按当前总持仓（含冻结）派现。
@@ -226,7 +262,7 @@ func (p *Portfolio) ApplySplit(symbol string, ratio, postPrice float64) error {
 	if pos != nil && (pos.Qty != 0 || pos.Frozen != 0) {
 		newQty := float64(pos.Qty) * ratio
 		newFrozen := float64(pos.Frozen) * ratio
-		if newQty != math.Tr(newQty) || newFrozen != math.Tr(newFrozen) {
+		if newQty != math.Trunc(newQty) || newFrozen != math.Trunc(newFrozen) {
 			return fmt.Errorf("split ratio %g produces fractional shares for %s", ratio, symbol)
 		}
 		pos.Qty = int64(newQty)
