@@ -67,12 +67,16 @@ func genReplay(n, days int, symbols int, seed int64, duplicate bool) []event.Eve
 				evs = append(evs, evs[len(evs)-1]) // 重复投递
 			}
 		}
-		for s := 0; s < symbols; s++ {
-			seq++
-			evs = append(evs, event.Event{EventID: fmt.Sprintf("close-%d-%d", d, s), Seq: seq,
-				Kind: event.KindDayClose, Symbol: sym(int64(s)), TradingDay: int64(d),
-				ClosePrice: 50 + float64(seq%200)/4})
-		}
+		// 整日收口：一天只投一次收盘（不带标的），并重复投递一次验证幂等。
+		seq++
+		close := event.Event{EventID: fmt.Sprintf("close-%d", d), Seq: seq,
+			Kind: event.KindDayClose, TradingDay: int64(d)}
+		evs = append(evs, close)
+		seq++
+		dup := close
+		dup.EventID = fmt.Sprintf("close-%d-dup", d)
+		dup.Seq = seq
+		evs = append(evs, dup)
 	}
 	return evs
 }

@@ -136,23 +136,107 @@ func TestOvernightMarkToMarket(t *testing.T) {
 	ok(approx(s3.Portfolio.Equity, 10_000_000-101*100+100*100))
 }
 
-// 不同标的收盘互不影响。
-func TestDayClosePerSymbol(t *testing.T) {
+// 多标的只投一次收盘：一次收盘把当天全部标的收干净。
+// 事件带 AAA 与收盘价：AAA 盯市价更新，BBB 的当日单同样失效、冻结退回。
+func TestDayCloseAllSymbolsAtOnce(t *testing.T) {
+	eng, ok := newDayEngine(t, 10_000_000)
+	eng.Process(q("qa", 1, "AAA", 99, 101), q("qb", 1, "BBB", 49, 51))
+	eng.Process(submitEv("da", 2, "AAA", event.Buy, event.Limit, 90, 0, 10, event.TIODay))
+	eng.Process(submitEv("db", 2, "BBB", event.Buy, event.Limit, 40, 0, 10, event.TIODay))
+	eng.Process(submitEv("sa", 2, "AAA", event.Buy, event.Stop, 0, 120, 5, event.TIODay))
+	eng.Process(submitEv("ga", 2, "AAA", event.Buy, event.Limit, 91, 0, 10, event.TGTC))
+
+	r := eng.Process(closeEv("c1", 3, 1, "AAA", 100))[0]
+	ok(len(r.ExpiredOrderIDs) == 3)
+	va, _ := eng.Order("da")
+	vb, _ := eng.Order("db")
+	vs, _ := eng.Order("sa")
+	vg, _ := eng.Order("ga")
+	ok(va.Status == StatusExpired && vb.Status == StatusExpired && vs.Status == StatusExpired)
+	ok(vg.Status == StatusNew) // GTC 单不受影响
+
+	snap, err := eng.Snapshot()
+	ok(err == nil)
+	// 两个标的的当日单冻结全部退回，只剩 GTC 单的 910。
+	ok(approx(snap.Portfolio.FrozenCash, 910))
+	ok(approx(snap.Portfolio.Marks["AAA"], 100))
+	ok(approx(snap.Portfolio.Marks["BBB"], 50)) // BBB 盯市价保持收盘前行情
+}
+
+// 不带标的的收盘：同样整日收口，且不会在盯市里凭空多出空标的记录。
+func TestDayCloseWithoutSymbol(t *testing.T) {
 	eng, ok := newDayEngine(t, 10_000_000)
 	eng.Process(q("qa", 1, "AAA", 99, 101), q("qb", 1, "BBB", 49, 51))
 	eng.Process(submitEv("da", 2, "AAA", event.Buy, event.Limit, 90, 0, 10, event.TIODay))
 	eng.Process(submitEv("db", 2, "BBB", event.Buy, event.Limit, 40, 0, 10, event.TIODay))
 
-	r := eng.Process(closeEv("ca", 3, 1, "AAA", 100))[0]
-	ok(len(r.ExpiredOrderIDs) == 1 && r.ExpiredOrderIDs[0] == "da")
-	va, _ := eng.Order("da")
-	vb, _ := eng.Order("db")
-	ok(va.Status == StatusExpired && vb.Status == StatusNew)
+	r := eng.Process(closeEv("c1", 3, 1, "", 0))[0]
+	ok(len(r.ExpiredOrderIDs) == 2)
+	snap, err := eng.Snapshot()
+	ok(err == nil)
+	_, hasEmpty := snap.Portfolio.Marks[""]
+	ok(!hasEmpty)
+	ok(approx(snap.Portfolio.FrozenCash, 0))
+	ok(approx(snap.Portfolio.Marks["AAA"], 100) && approx(snap.Portfolio.Marks["BBB"], 50))
+	ok(eng.CurrentTradingDay() == 1)
+}
 
-	r = eng.Process(closeEv("cb", 4, 1, "BBB", 50))[0]
-	ok(r.ExpiredOrderIDs[0] == "db")
-	vb2, _ := eng.Order("db")
-	ok(vb2.Status == StatusExpired)
+// 收盘后可取当日日终快照：权益拆解与对账口径一致；重复收盘不改写。
+func TestDayEndSnapshot(t *testing.T) {
+	eng, ok := newDayEngine(t, 10_000_000)
+	eng.Process(q("q1", 1, "AAA", 99, 101))
+	// 100 股 @101 成交建仓，再挂一张当日单（收盘失效退冻结）。
+	eng.Process(submitEv("h1", 2, "AAA", event.Buy, event.Limit, 101, 0, 100, event.TGTC))
+	eng.Process(submitEv("d1", 3, "AAA", event.Buy, event.Limit, 80, 0, 10, event.TIODay))
+	eng.Process(closeEv("c1", 4, 1, "AAA", 110))
+
+	snap, found, err := eng.DayEndSnapshot(1)
+	ok(found && err == nil)
+	ok(approx(snap.Equity, 10_000_000-101*100+110*100))
+	ok(approx(snap.Cash, 10_000_000-101*100))
+	ok(approx(snap.FrozenCash, 0))
+	ok(snap.Positions["AAA"].Qty == 100)
+	ok(approx(snap.UnrealizedPnL, (110-101)*100))
+	ok(approx(snap.RealizedPnL, 0))
+	ok(approx(snap.Marks["AAA"], 110))
+
+	// 换事件编号重复收盘：日终快照不变。
+	eng.Process(closeEv("c1b", 5, 1, "AAA", 130))
+	snap2, found, err := eng.DayEndSnapshot(1)
+	ok(found && err == nil)
+	ok(approx(snap2.Equity, snap.Equity) && approx(snap2.Marks["AAA"], 110))
+
+	// 未收盘的交易日取不到快照。
+	_, found, err = eng.DayEndSnapshot(2)
+	ok(!found && err == nil)
+}
+
+// 日终失效的单子第二天既不能成交也不能撤。
+func TestExpiredOrderDeadNextDay(t *testing.T) {
+	eng, ok := newDayEngine(t, 10_000_000)
+	eng.Process(q("q1", 1, "AAA", 99, 101))
+	eng.Process(submitEv("d1", 2, "AAA", event.Buy, event.Limit, 80, 0, 10, event.TIODay))
+	eng.Process(submitEv("s1", 3, "AAA", event.Buy, event.Stop, 0, 95, 10, event.TIODay))
+	eng.Process(closeEv("c1", 4, 1, "AAA", 100))
+
+	// 第二天：行情穿越 80，失效挂单不成交；条件单已失效不再触发。
+	r := eng.Process(q("q2", 5, "AAA", 79, 81))[0]
+	ok(len(r.Fills) == 0)
+	r = eng.Process(q("q3", 6, "AAA", 96, 97))[0]
+	ok(len(r.Fills) == 0)
+
+	// 撤单与再撤单都按已过期拒绝。
+	r = eng.Process(cancelEv("d1", 7, "AAA"))[0]
+	ok(r.Reject != nil && r.Reject.Reason == RejectOrderExpired)
+	r = eng.Process(cancelEv("s1", 8, "AAA"))[0]
+	ok(r.Reject != nil && r.Reject.Reason == RejectOrderExpired)
+
+	vd, _ := eng.Order("d1")
+	vs, _ := eng.Order("s1")
+	ok(vd.Status == StatusExpired && vd.FilledQty == 0)
+	ok(vs.Status == StatusExpired)
+	snap, err := eng.Snapshot()
+	ok(err == nil && approx(snap.Portfolio.FrozenCash, 0))
 }
 
 // 日终批量失效与行情、收盘并发/乱序到达：最终结果与顺序无关。

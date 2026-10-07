@@ -4,29 +4,49 @@
 
 字段：
 
-- `Symbol`：按标的独立收盘；不同标的互不影响。
+- `Symbol`：可填可不填。**收盘按整日收口**：一次收盘对全部标的生效，
+  与事件带不带标的、带的是哪个标的无关。`Symbol` 仅配合 `ClosePrice`
+  决定更新哪个标的的盯市价。
 - `TradingDay`：交易日序号（建议从 1 起单调递增）。填 0 时由引擎按收到顺序推断。
-- `ClosePrice`：收盘价。`> 0` 时更新该标的盯市价；`<= 0` 表示只做收盘不改盯市价。
+- `ClosePrice`：收盘价。`Symbol` 非空且 `> 0` 时更新该标的盯市价；
+  不带标的的收盘只做收口，不会在行情或盯市里凭空产生空标的的记录。
 
 一个收盘事件依次完成：
 
-1. 校验交易日序号：同一标的上 `TradingDay` 不允许倒退，倒退返回
+1. 校验交易日序号：`TradingDay` 不允许倒退（全局，不按标的），倒退返回
    `STALE_TRADING_DAY`。
-2. `ClosePrice > 0` 时把最新价 / 买价 / 卖价 / 盯市价统一更新到收盘价。
-3. 该标的的 `DAY` 委托批量失效：
+2. `Symbol` 非空且 `ClosePrice > 0` 时把该标的的最新价 / 买价 / 卖价 /
+   盯市价统一更新到收盘价。
+3. **全部标的**的 `DAY` 委托批量失效：
    - `WAITING_TRIGGER` 的当日条件单（未触发）；
    - `NEW / PARTIALLY_FILLED` 的当日挂单（未成交完）。
    - 失效订单进入 `EXPIRED`，冻结资金 / 冻结持仓一次性退回，
      不产生成交、不重复退钱退货。结果在 `Result.ExpiredOrderIDs` 中返回。
 4. GTC 单（含 GTC 条件单）不受影响，隔夜继续挂着 / 继续等待触发。
+5. 结算并冻结当日的**日终快照**（见下节）。
+
+## 日终快照（`DayEndSnapshot`）
+
+收盘完成后可通过 `eng.DayEndSnapshot(day)` 取该交易日的日终快照：
+
+- 内容：`portfolio.Snapshot`，含权益（`Equity`）、现金（`Cash`）、
+  冻结资金（`FrozenCash`）、逐标的持仓（`Positions`）、已实现盈亏
+  （`RealizedPnL`）、未实现盈亏（`UnrealizedPnL`）、累计费用（`Fees`）、
+  公司行为调整（`CorporateActions`）与盯市价表（`Marks`）。
+- 对账口径与 `Snapshot()` 完全一致：权益恒等式在收盘时校验，
+  拆不平时 `DayEndSnapshot` 返回 `portfolio.ReconcileError`（快照一并返回），
+  绝不静默吞掉。
+- 快照在收盘时一次性冻结：同一交易日重复收盘（含换事件编号）不会改写；
+  未收盘的交易日返回 `ok=false`。
 
 ## 幂等
 
 - 收盘事件本身走全局 `EventID` 幂等：相同 `EventID` 重复投递返回首个结果。
-- 同一 `(Symbol, TradingDay)` 即使换了 `EventID` 重复收盘，也**不会**
-  二次失效、二次释放冻结、二次改动盯市价，返回的 `ExpiredOrderIDs` 为空。
+- 同一 `TradingDay` 即使换了 `EventID` 重复收盘，也**不会**
+  二次失效、二次释放冻结、二次改动盯市价、二次结算快照，
+  返回的 `ExpiredOrderIDs` 为空。
 - 已 `EXPIRED` 的订单不会被二次失效；对其撤单返回 `ORDER_EXPIRED`，
-  对其再投递任何行情都不会成交。
+  第二天行情再怎么穿越也不会成交、也不会再触发。
 
 ## 跨日盯市与权益拆解
 

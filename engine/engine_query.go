@@ -56,3 +56,17 @@ func (e *Engine) Order(id string) (OrderView, bool) {
 	}
 	return OrderView{*o}, true
 }
+
+// DayEndSnapshot 返回某个已收盘交易日收盘时结算并冻结的日终快照。
+// ok=false 表示该交易日尚未收盘。err 非 nil 表示当日权益拆解对不上
+// （portfolio.ReconcileError），快照仍一并返回，绝不静默吞掉。
+// 同一交易日重复收盘不会改写该快照。
+func (e *Engine) DayEndSnapshot(day int64) (portfolio.Snapshot, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rec, ok := e.daySnapshots[day]
+	if !ok {
+		return portfolio.Snapshot{}, false, nil
+	}
+	return rec.snap, true, rec.err
+}

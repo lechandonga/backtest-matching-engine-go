@@ -6,7 +6,8 @@ package engine
 //   - 投递：Submit 只入缓冲；Drain/Process 把缓冲事件按 (Seq, EventID)
 //     排序后顺序应用。因此同一批事件无论并发投递、乱序投递、重复投递
 //     （相同 EventID 只生效一次）多少遍，最终状态完全一致。
-//   - 不同标的：订单簿、触发条件、日终失效均按标的独立维护，互不影响。
+//   - 不同标的：订单簿、触发条件按标的独立维护，互不影响；收盘事件
+//     按整日收口，一次收盘对全部标的的当日单统一失效。
 //   - 触发：触发型委托在每个行情事件上至多评估一次；触发后进入普通
 //     委托流程，且触发基准（含跟踪止损锚点）从此冻结。
 
@@ -73,8 +74,11 @@ type Engine struct {
 
 	pending []event.Event
 
-	currentDay int64 // 已收盘到的交易日序号
-	lastClose  map[string]int64
+	currentDay   int64 // 已收盘到的交易日序号
+	lastCloseDay int64 // 最近一次收盘的交易日序号（整日收口，全局唯一）
+
+	// 每个已收盘交易日的日终快照（收盘时一次性结算并冻结，重复收盘不改写）。
+	daySnapshots map[int64]dayEndRecord
 
 	dayCounter int64 // TradingDay=0 的收盘事件按此推断
 }
@@ -82,17 +86,17 @@ type Engine struct {
 // New 创建引擎。
 func New(pf *portfolio.Portfolio) *Engine {
 	return &Engine{
-		pf:        pf,
-		orders:    make(map[string]*Order),
-		byEventID: make(map[string]string),
-		bids:      make(map[string][]*Order),
-		asks:      make(map[string][]*Order),
-		waiters:   make(map[string]map[string]*Order),
-		bidPrice:  make(map[string]float64),
-		askPrice:  make(map[string]float64),
-		lastPx:    make(map[string]float64),
-		results:   make(map[string]*Result),
-		lastClose: make(map[string]int64),
+		pf:           pf,
+		orders:       make(map[string]*Order),
+		byEventID:    make(map[string]string),
+		bids:         make(map[string][]*Order),
+		asks:         make(map[string][]*Order),
+		waiters:      make(map[string]map[string]*Order),
+		bidPrice:     make(map[string]float64),
+		askPrice:     make(map[string]float64),
+		lastPx:       make(map[string]float64),
+		results:      make(map[string]*Result),
+		daySnapshots: make(map[int64]dayEndRecord),
 	}
 }
 
