@@ -1,80 +1,115 @@
 package engine
 
 import (
+	"sort"
+
 	"github.com/lechandonga/backtest-matching-engine-go/event"
 )
 
-// applyDayCloseLocked 交易日收盘：
-//   - 同一 (Symbol, TradingDay) 重复收盘幂等，不重复失效、不重复退钱退货；
-//   - DAY 单（未成交完的当日单、未触发条件单）统一失效并释放冻结；
-//   - 收盘价 > 0 时更新盯市价，隔夜仓位继续按新行情盯市；
-//   - 不同标的的收盘互不影响。
+// dayEndRecord 是某交易日收盘时固化的日终快照及对账结果。
+type dayEndRecord struct {
+	snap AccountSnapshot
+	err  error // 权益拆解对不上时的 ReconcileError（不静默吞掉）
+}
+
+// applyDayCloseLocked 交易日收盘：一次收盘收口一整天，与事件是否携带
+// 标的、携带哪个标的无关。
+//
+//   - 当天所有标的未成交完的当日单、未触发的当日条件单统一失效，
+//     冻结资金/冻结持仓原路退回，不漏也不多退；
+//   - 事件同时携带标的与正收盘价时，仅更新该标的的盯市价；
+//     不带标的的收盘不会在行情/盯市里产生空标的记录；
+//   - TradingDay 倒退拒绝（STALE_TRADING_DAY）；同一交易日重复收盘
+//     （即使换了 EventID）幂等：不二次失效、不重复退钱退货、快照不变；
+//   - 收盘完成后固化该交易日的日终快照（DayEndSnapshot 可取）。
 func (e *Engine) applyDayCloseLocked(ev event.Event, res *Result) {
 	day := ev.TradingDay
 	if day == 0 {
 		e.dayCounter++
 		day = e.dayCounter
 	}
-	if day < e.lastClose[ev.Symbol] {
+	if day < e.lastCloseDay {
 		res.Reject = reject(ev.OrderID, RejectStaleTradingDay,
-			"trading day must be non-decreasing per symbol")
+			"trading day must be non-decreasing")
 		return
 	}
-	if day == e.lastClose[ev.Symbol] {
+	if day == e.lastCloseDay {
 		// 同一交易日重复收盘：幂等返回，不做任何状态变化。
 		return
 	}
-	e.lastClose[ev.Symbol] = day
+	e.lastCloseDay = day
 	if day > e.currentDay {
 		e.currentDay = day
 	}
 
-	if ev.ClosePrice > 0 {
+	// 收盘价盯市：必须同时给出标的与正收盘价。
+	if ev.Symbol != "" && ev.ClosePrice > 0 {
 		e.lastPx[ev.Symbol] = ev.ClosePrice
 		e.bidPrice[ev.Symbol] = ev.ClosePrice
 		e.askPrice[ev.Symbol] = ev.ClosePrice
 		e.pf.SetMark(ev.Symbol, ev.ClosePrice)
 	}
 
-	// 1) 未触发的当日条件单失效（触发前没有任何冻结）。
-	for id, o := range e.waiters[ev.Symbol] {
-		if o.TIF == event.TIODay {
-			delete(e.waiters[ev.Symbol], id)
-			o.Status = StatusExpired
-			res.ExpiredOrderIDs = append(res.ExpiredOrderIDs, o.ID)
+	// 全部标的的当日单统一失效。先收集再按 (提交Seq, OrderID) 排序，
+	// 保证失效顺序确定、与 map 遍历顺序无关。
+	expiring := make([]*Order, 0)
+	for _, w := range e.waiters {
+		for _, o := range w {
+			if o.TIF == event.TIODay {
+				expiring = append(expiring, o)
+			}
 		}
 	}
-
-	// 2) 未成交完的当日挂单失效，冻结干净退回。
-	for _, side := range []event.Side{event.Buy, event.Sell} {
-		book := e.bookFor(ev.Symbol, side)
-		out := book[:0]
+	for _, book := range e.bids {
 		for _, o := range book {
 			if o.TIF == event.TIODay {
-				e.releaseReserveLocked(o, o.RemainingQty())
-				o.Status = StatusExpired
-				res.ExpiredOrderIDs = append(res.ExpiredOrderIDs, o.ID)
-				continue
+				expiring = append(expiring, o)
 			}
-			out = append(out, o)
 		}
-		e.setBook(ev.Symbol, side, out)
 	}
-
-	// 3) 已提交但尚未入簿/入待触发集合的 DAY 单（理论上不存在），兜底扫描。
-	for _, o := range e.orders {
-		if o.Symbol != ev.Symbol || o.TIF != event.TIODay {
-			continue
-		}
-		switch o.Status {
-		case StatusNew, StatusPartiallyFilled, StatusWaitingTrigger:
-			if o.Status == StatusWaitingTrigger {
-				delete(e.waiters[o.Symbol], o.ID)
+	for _, book := range e.asks {
+		for _, o := range book {
+			if o.TIF == event.TIODay {
+				expiring = append(expiring, o)
 			}
+		}
+	}
+	sort.Slice(expiring, func(i, j int) bool {
+		if expiring[i].Seq != expiring[j].Seq {
+			return expiring[i].Seq < expiring[j].Seq
+		}
+		return expiring[i].ID < expiring[j].ID
+	})
+
+	for _, o := range expiring {
+		switch o.Status {
+		case StatusWaitingTrigger:
+			// 触发前没有任何冻结，直接移出待触发集合。
+			delete(e.waiters[o.Symbol], o.ID)
+		case StatusNew, StatusPartiallyFilled:
 			e.removeFromBookLocked(o, o.RemainingQty())
 			e.releaseReserveLocked(o, o.RemainingQty())
-			o.Status = StatusExpired
-			res.ExpiredOrderIDs = append(res.ExpiredOrderIDs, o.ID)
+		default:
+			continue
 		}
+		o.Status = StatusExpired
+		res.ExpiredOrderIDs = append(res.ExpiredOrderIDs, o.ID)
 	}
+
+	// 固化当日日终快照；对账失败随快照一起保存，取快照时明确报出。
+	snap, err := e.snapshotLocked()
+	e.daySnaps[day] = dayEndRecord{snap: snap, err: err}
+}
+
+// DayEndSnapshot 返回指定交易日收盘时固化的日终快照（含权益与现金、
+// 冻结、持仓、已实现/未实现盈亏拆解）。ok=false 表示该交易日尚未收盘。
+// err 为收盘对账时的 ReconcileError；权益拆解对不上时明确返回，不静默吞掉。
+func (e *Engine) DayEndSnapshot(day int64) (snap AccountSnapshot, ok bool, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rec, ok := e.daySnaps[day]
+	if !ok {
+		return AccountSnapshot{}, false, nil
+	}
+	return rec.snap, true, rec.err
 }

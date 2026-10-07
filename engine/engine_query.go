@@ -20,7 +20,11 @@ type AccountSnapshot struct {
 func (e *Engine) Snapshot() (AccountSnapshot, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.snapshotLocked()
+}
 
+// snapshotLocked 是 Snapshot 的无锁版本，供收盘固化日终快照等内部路径复用。
+func (e *Engine) snapshotLocked() (AccountSnapshot, error) {
 	pfSnap, err := e.pf.Snapshot()
 	if err != nil {
 		return AccountSnapshot{Portfolio: pfSnap, TradingDay: e.currentDay}, err

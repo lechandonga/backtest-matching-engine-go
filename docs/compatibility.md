@@ -29,3 +29,16 @@
 `INSUFFICIENT_POSITION`；只有**触发瞬间**不足才使用
 `TRIGGER_INSUFFICIENT_*`。`EXPIRED` 订单的后续操作使用 `ORDER_EXPIRED`，
 其它终态仍使用 `TERMINAL_ORDER`。
+
+## 本轮语义调整（收盘）
+
+- `KindDayClose` 从"按标的逐个收盘"调整为"一次收盘收口一整天（全部标的）"：
+  一个收盘事件即失效当天所有标的的当日单/当日条件单并退回冻结，
+  与事件是否携带标的无关；`Symbol`+`ClosePrice` 仅用于该标的收盘价盯市。
+- 旧用法（每天逐标的各投一个收盘事件）仍然安全：第一个收盘事件完成
+  整日收口，其余同交易日收盘按重复收盘幂等处理，不二次结算。
+- 新增查询：`Engine.DayEndSnapshot(day)` 返回收盘时固化的日终快照
+  （权益及现金/冻结/持仓/盈亏拆解），对账失败明确返回
+  `portfolio.ReconcileError`。
+- 除上述收盘语义外，其余旧行为（委托、撮合、触发、TIF、账户口径）
+  全部保持不变。

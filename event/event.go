@@ -17,7 +17,7 @@ const (
 	KindOrderCancel Kind = 4 // 撤销委托
 	KindSplit       Kind = 5 // 拆股/合股公司行为
 	KindDividend    Kind = 6 // 现金分红公司行为
-	KindDayClose    Kind = 7 // 交易日收盘：日终失效 + 收盘价盯市
+	KindDayClose    Kind = 7 // 交易日收盘：整日收口（全标的日终失效）+ 可选收盘价盯市
 )
 
 func (k Kind) String() string {
@@ -162,9 +162,10 @@ type Event struct {
 	PostSplit   float64 // KindSplit：除权后参考价，用于未实现盈亏盯市
 	DivPerShare float64 // KindDividend：每股派现金额（税前）
 
-	// 收盘事件字段（KindDayClose）。
+	// 收盘事件字段（KindDayClose）。一次收盘收口一整天（全部标的），
+	// 与 Symbol 是否填写无关；Symbol 仅用于收盘价盯市。
 	TradingDay int64   // 交易日序号（从 1 起单调递增）；0 表示由引擎按顺序推断
-	ClosePrice float64 // 收盘价：>0 时用于该标的日终盯市
+	ClosePrice float64 // 收盘价：>0 且 Symbol 非空时用于该标的日终盯市
 }
 
 func (e Event) String() string {
